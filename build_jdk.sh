@@ -30,7 +30,7 @@ AUTOCONF_EXTRA_ARGS+="OBJCOPY=$OBJCOPY \
   "
 
 export BOOT_JDK=$PWD/jdk-20
-export CFLAGS+=" -DANDROID"
+export CFLAGS+=" -DANDROID -Wno-error=implicit-function-declaration -Wno-error=int-conversion"
 export LDFLAGS+=" -L$PWD/dummy_libs -Wl,--undefined-version" 
 
 # Create dummy libraries so we won't have to remove them in OpenJDK makefiles
