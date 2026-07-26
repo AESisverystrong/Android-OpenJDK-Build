@@ -30,7 +30,7 @@ AUTOCONF_EXTRA_ARGS+="OBJCOPY=$OBJCOPY \
   "
 
 export BOOT_JDK=$PWD/jdk-20
-export CFLAGS+=" -DANDROID -D_POSIX_C_SOURCE=200809L -D__ANDROID_API__=21" export CXXFLAGS="${CFLAGS}"
+export CFLAGS+=" -DANDROID"
 export LDFLAGS+=" -L$PWD/dummy_libs -Wl,--undefined-version" 
 
 # Create dummy libraries so we won't have to remove them in OpenJDK makefiles
@@ -49,7 +49,6 @@ git reset --hard
 git apply --reject --whitespace=fix ../patches/jdk21u_android.diff || exit 1
 git apply --reject --whitespace=fix ../patches/zgc_address_offset.patch || exit 1
 git apply --reject --whitespace=fix ../patches/zgc_sigsys_fix.patch || exit 1
-
 git apply --reject --whitespace=fix ../patches/posix_spawn_android.patch || exit 1
 
 bash ./configure \
