@@ -1,7 +1,7 @@
 diff --git a/src/java.base/unix/native/libjava/ProcessImpl_md.c b/src/java.base/unix/native/libjava/ProcessImpl_md.c
 --- a/src/java.base/unix/native/libjava/ProcessImpl_md.c
 +++ b/src/java.base/unix/native/libjava/ProcessImpl_md.c
-@@ -1,3 +1,9 @@
+@@ -1,1 +1,7 @@
 +/* Ensure posix_spawn prototype is visible on build platforms */
 +#ifndef _POSIX_C_SOURCE
 +#  define _POSIX_C_SOURCE 200809L
@@ -9,4 +9,3 @@ diff --git a/src/java.base/unix/native/libjava/ProcessImpl_md.c b/src/java.base/
 +#include <spawn.h>
 +
  /*
-  * Copyright (c)
