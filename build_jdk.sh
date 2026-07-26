@@ -50,8 +50,6 @@ git apply --reject --whitespace=fix ../patches/jdk21u_android.diff || exit 1
 git apply --reject --whitespace=fix ../patches/zgc_address_offset.patch || exit 1
 git apply --reject --whitespace=fix ../patches/zgc_sigsys_fix.patch || exit 1
 
-git apply --reject --whitespace=fix ../patches/posix_spawn.patch || exit 1
-
 bash ./configure \
     --with-boot-jdk=$BOOT_JDK \
     --openjdk-target=$TARGET \
