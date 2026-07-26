@@ -1,3 +1,4 @@
+diff --git a/src/java.base/unix/native/libjava/ProcessImpl_md.c b/src/java.base/unix/native/libjava/ProcessImpl_md.c
 --- a/src/java.base/unix/native/libjava/ProcessImpl_md.c
 +++ b/src/java.base/unix/native/libjava/ProcessImpl_md.c
 @@ -44,7 +44,11 @@
@@ -10,3 +11,5 @@
  #include <spawn.h>
 +#endif
  #endif
+ 
+ #include "childproc.h"
