@@ -1,0 +1,77 @@
+--- a/src/hotspot/share/gc/z/shared/z_shared_globals.hpp
++++ b/src/hotspot/share/gc/z/shared/z_shared_globals.hpp
+@@ -87,6 +87,13 @@
+   product(bool, ZVerifyForwarding, false, DIAGNOSTIC,                       \
+           "Verify forwarding tables")                                       \
+                                                                             \
++  product(uint, ZAddressOffsetBitsOverride, 0, EXPERIMENTAL,                \
++          "Override the calculated number of address offset bits used by "  \
++          "ZGC. 0 means use the automatically probed/calculated value. "    \
++          "Useful on platforms with restricted virtual address space "      \
++          "(e.g. 39-bit VA) to leave room for large contiguous allocations.")\
++          range(0, 44)                                                      \
++                                                                            \
+   GC_X_FLAGS(                                                               \
+     develop,                                                                \
+     develop_pd,                                                             \
+--- a/src/hotspot/cpu/aarch64/gc/z/zAddress_aarch64.cpp
++++ b/src/hotspot/cpu/aarch64/gc/z/zAddress_aarch64.cpp
+@@ -91,6 +91,12 @@
+ }
+ 
+ size_t ZPlatformAddressOffsetBits() {
++  // Allow explicit override (useful on 39-bit VA Android devices)
++  if (ZAddressOffsetBitsOverride != 0) {
++    log_info_p(gc, init)("Using ZAddressOffsetBitsOverride: " UINT32_FORMAT, ZAddressOffsetBitsOverride);
++    return ZAddressOffsetBitsOverride;
++  }
++
+   const static size_t valid_max_address_offset_bits = probe_valid_max_address_bit() + 1;
+   const size_t max_address_offset_bits = valid_max_address_offset_bits - 3;
+   const size_t min_address_offset_bits = max_address_offset_bits - 2;
+--- a/src/hotspot/cpu/aarch64/gc/x/xGlobals_aarch64.cpp
++++ b/src/hotspot/cpu/aarch64/gc/x/xGlobals_aarch64.cpp
+@@ -197,6 +197,13 @@
+ }
+ 
+ size_t XPlatformAddressOffsetBits() {
++  // Allow explicit override (useful on 39-bit VA Android devices)
++  // Note: ZAddressOffsetBitsOverride is shared between X and Z
++  if (ZAddressOffsetBitsOverride != 0) {
++    log_info_p(gc, init)("Using ZAddressOffsetBitsOverride: " UINT32_FORMAT, ZAddressOffsetBitsOverride);
++    return ZAddressOffsetBitsOverride;
++  }
++
+   const static size_t valid_max_address_offset_bits = probe_valid_max_address_bit() + 1;
+   const size_t max_address_offset_bits = valid_max_address_offset_bits - 3;
+   const size_t min_address_offset_bits = max_address_offset_bits - 2;
+--- a/src/hotspot/os/linux/gc/z/zPhysicalMemoryBacking_linux.cpp
++++ b/src/hotspot/os/linux/gc/z/zPhysicalMemoryBacking_linux.cpp
+@@ -668,7 +668,11 @@
+   for (;;) {
+     length = align_down((end - start) / 2, ZGranuleSize);
+     if (length < ZGranuleSize) {
+-      // Done, don't commit more
++      // Binary search exhausted. Try one last single granule if remaining.
++      // Without this, a trailing granule can be left uncommitted (off-by-one).
++      if ((end - start) >= ZGranuleSize && commit_inner(start, ZGranuleSize)) {
++        start += ZGranuleSize;
++      }
+       return start - offset;
+     }
+ 
+--- a/src/hotspot/os/linux/gc/x/xPhysicalMemoryBacking_linux.cpp
++++ b/src/hotspot/os/linux/gc/x/xPhysicalMemoryBacking_linux.cpp
+@@ -667,7 +667,11 @@
+   for (;;) {
+     length = align_down((end - start) / 2, XGranuleSize);
+     if (length < XGranuleSize) {
+-      // Done, don't commit more
++      // Binary search exhausted. Try one last single granule if remaining.
++      // Without this, a trailing granule can be left uncommitted (off-by-one).
++      if ((end - start) >= XGranuleSize && commit_inner(start, XGranuleSize)) {
++        start += XGranuleSize;
++      }
+       return start - offset;
+     }
+ 
