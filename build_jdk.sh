@@ -49,7 +49,9 @@ git reset --hard
 git apply --reject --whitespace=fix ../patches/jdk21u_android.diff || exit 1
 git apply --reject --whitespace=fix ../patches/zgc_address_offset.patch || exit 1
 git apply --reject --whitespace=fix ../patches/zgc_sigsys_fix.patch || exit 1
-git apply --reject --whitespace=fix ../patches/posix_spawn_android.patch || exit 1
+
+sed -i 's|#include <spawn.h>|#ifdef __ANDROID__\n#include "posix_spawn.h"\n#else\n#include <spawn.h>\n#endif|' \
+  src/java.base/unix/native/libjava/ProcessImpl_md.c || exit 1
 
 bash ./configure \
     --with-boot-jdk=$BOOT_JDK \
