@@ -1,0 +1,60 @@
+--- a/src/hotspot/share/gc/z/shared/z_shared_globals.hpp
++++ b/src/hotspot/share/gc/z/shared/z_shared_globals.hpp
+@@ -94,6 +94,17 @@
+           "(e.g. 39-bit VA) to leave room for large contiguous allocations.")\
+           range(0, 44)                                                      \
+                                                                             \
++  product(uint, ZAddressSpaceRatio, 0, EXPERIMENTAL,                        \
++          "Override the virtual-to-physical address space ratio used by "   \
++          "ZGC/XGC. 0 means use the default (16). Higher values reserve "   \
++          "more virtual address space for relocation.")                     \
++          range(0, 64)                                                      \
++                                                                            \
++  product(uint, ZMaxAddressBit, 0, EXPERIMENTAL,                            \
++          "Bypass address space probing and force this max address bit. "  \
++          "0 means use automatic probing. Useful in sandboxed envs.")      \
++          range(0, 46)                                                      \
++                                                                            \
+   GC_X_FLAGS(                                                               \
+     develop,                                                                \
+     develop_pd,                                                             \
+--- a/src/hotspot/cpu/aarch64/gc/z/zAddress_aarch64.cpp
++++ b/src/hotspot/cpu/aarch64/gc/z/zAddress_aarch64.cpp
+@@ -97,10 +97,16 @@
+     return ZAddressOffsetBitsOverride;
+   }
+ 
++  if (ZMaxAddressBit != 0) {
++    log_info_p(gc, init)("Address space probing bypassed, using -XX:ZMaxAddressBit=" UINT32_FORMAT, ZMaxAddressBit);
++    return (size_t)ZMaxAddressBit;
++  }
++
+   const static size_t valid_max_address_offset_bits = probe_valid_max_address_bit() + 1;
+   const size_t max_address_offset_bits = valid_max_address_offset_bits - 3;
+   const size_t min_address_offset_bits = max_address_offset_bits - 2;
+-  const size_t address_offset = round_up_power_of_2(MaxHeapSize * ZVirtualToPhysicalRatio);
++  const size_t ratio = ZAddressSpaceRatio != 0 ? (size_t)ZAddressSpaceRatio : (size_t)ZVirtualToPhysicalRatio;
++  const size_t address_offset = round_up_power_of_2(MaxHeapSize * ratio);
+   const size_t address_offset_bits = log2i_exact(address_offset);
+   return clamp(address_offset_bits, min_address_offset_bits, max_address_offset_bits);
+ }
+--- a/src/hotspot/cpu/aarch64/gc/x/xGlobals_aarch64.cpp
++++ b/src/hotspot/cpu/aarch64/gc/x/xGlobals_aarch64.cpp
+@@ -204,10 +204,16 @@
+     return ZAddressOffsetBitsOverride;
+   }
+ 
++  if (ZMaxAddressBit != 0) {
++    log_info_p(gc, init)("Address space probing bypassed, using -XX:ZMaxAddressBit=" UINT32_FORMAT, ZMaxAddressBit);
++    return (size_t)ZMaxAddressBit;
++  }
++
+   const static size_t valid_max_address_offset_bits = probe_valid_max_address_bit() + 1;
+   const size_t max_address_offset_bits = valid_max_address_offset_bits - 3;
+   const size_t min_address_offset_bits = max_address_offset_bits - 2;
+-  const size_t address_offset = round_up_power_of_2(MaxHeapSize * XVirtualToPhysicalRatio);
++  const size_t ratio = ZAddressSpaceRatio != 0 ? (size_t)ZAddressSpaceRatio : (size_t)XVirtualToPhysicalRatio;
++  const size_t address_offset = round_up_power_of_2(MaxHeapSize * ratio);
+   const size_t address_offset_bits = log2i_exact(address_offset);
+   return clamp(address_offset_bits, min_address_offset_bits, max_address_offset_bits);
+ }
