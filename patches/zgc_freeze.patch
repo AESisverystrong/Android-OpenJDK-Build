@@ -1,5 +1,31 @@
+diff --git a/src/hotspot/share/gc/shared/gcCause.cpp b/src/hotspot/share/gc/shared/gcCause.cpp
+index 426154fdc..fa7c60f05 100644
+--- a/src/hotspot/share/gc/shared/gcCause.cpp
++++ b/src/hotspot/share/gc/shared/gcCause.cpp
+@@ -126,6 +126,9 @@ const char* GCCause::to_string(GCCause::Cause cause) {
+     case _z_high_usage:
+       return "High Usage";
+ 
++    case _z_freeze:
++      return "ZFreeze";
++
+     case _last_gc_cause:
+       return "ILLEGAL VALUE - last gc cause - ILLEGAL VALUE";
+ 
+diff --git a/src/hotspot/share/gc/shared/gcCause.hpp b/src/hotspot/share/gc/shared/gcCause.hpp
+index 152ca787f..968e24e26 100644
+--- a/src/hotspot/share/gc/shared/gcCause.hpp
++++ b/src/hotspot/share/gc/shared/gcCause.hpp
+@@ -86,6 +86,7 @@ class GCCause : public AllStatic {
+     _z_allocation_stall,
+     _z_proactive,
+     _z_high_usage,
++    _z_freeze,
+ 
+     _last_gc_cause
+   };
 diff --git a/src/hotspot/share/gc/z/zDirector.cpp b/src/hotspot/share/gc/z/zDirector.cpp
-index 417ac33a..47757a53 100644
+index 417ac33a6..c65065ef8 100644
 --- a/src/hotspot/share/gc/z/zDirector.cpp
 +++ b/src/hotspot/share/gc/z/zDirector.cpp
 @@ -26,6 +26,7 @@
@@ -10,7 +36,7 @@ index 417ac33a..47757a53 100644
  #include "gc/z/zGeneration.inline.hpp"
  #include "gc/z/zHeap.inline.hpp"
  #include "gc/z/zHeuristics.hpp"
-@@ -905,6 +906,29 @@ void ZDirector::run_thread() {
+@@ -905,6 +906,27 @@ void ZDirector::run_thread() {
    // Main loop
    while (wait_for_tick()) {
      ZDirectorStats stats = sample_stats();
@@ -19,33 +45,59 @@ index 417ac33a..47757a53 100644
 +    // dedicated thread avoids introducing another GC thread lifecycle, and the
 +    // director already runs at a fixed, low frequency. The probe itself is
 +    // throttled by ZFreezeMinPollMillis.
++    //
++    // GCCause::_z_freeze is in the unconditional return-true group of
++    // should_preclean_young(), so ZDriverMajor::collect_young() runs
++    // ZYoungType::major_full_preclean and everything live in young is promoted
++    // before the freeze happens. Do not "optimise" this to a cause that falls
++    // through to ScavengeBeforeFullGC: that flag can be turned off, and the
++    // frozen set would then be born holding out-edges into young space.
++    //
++    // Starting the collection from here rather than through
++    // CollectedHeap::collect() is also what makes the request independent of
++    // -XX:+DisableExplicitGC, which is only ever checked in JVM_GC.
 +    if (ZFreeze::poll() && !ZDriver::major()->is_busy()) {
-+      // The cause matters. ZDriverMajor::collect_young() only runs
-+      // ZYoungType::major_full_preclean - "collect young generation and promote
-+      // everything to old generation" - when should_preclean_young() says so,
-+      // and GCCause::_z_timer is explicitly in the list that does NOT.
-+      //
-+      // Without the preclean, the live young generation is still outside the
-+      // set that gets frozen at the following old mark start, so the frozen set
-+      // is born holding out-edges into young space. Those targets are then
-+      // collected while the frozen pages still point at them.
-+      //
-+      // _java_lang_system_gc precleans and, per should_clear_soft_references(),
-+      // does not clear soft references. It is not routed through
-+      // CollectedHeap::collect(), so -XX:+DisableExplicitGC does not block it.
-+      start_major_gc(stats, GCCause::_java_lang_system_gc);
++      start_major_gc(stats, GCCause::_z_freeze);
 +      continue;
 +    }
 +
      if (!start_gc(stats)) {
        adjust_gc(stats);
      }
+diff --git a/src/hotspot/share/gc/z/zDriver.cpp b/src/hotspot/share/gc/z/zDriver.cpp
+index f0da73a7f..b58a76fd6 100644
+--- a/src/hotspot/share/gc/z/zDriver.cpp
++++ b/src/hotspot/share/gc/z/zDriver.cpp
+@@ -241,6 +241,7 @@ static bool should_clear_soft_references(GCCause::Cause cause) {
+   case GCCause::_heap_dump:
+   case GCCause::_heap_inspection:
+   case GCCause::_wb_breakpoint:
++  case GCCause::_z_freeze:
+   case GCCause::_dcmd_gc_run:
+   case GCCause::_java_lang_system_gc:
+   case GCCause::_full_gc_alot:
+@@ -274,6 +275,7 @@ static bool should_preclean_young(GCCause::Cause cause) {
+   case GCCause::_heap_dump:
+   case GCCause::_heap_inspection:
+   case GCCause::_wb_full_gc:
++  case GCCause::_z_freeze:
+   case GCCause::_wb_breakpoint:
+   case GCCause::_dcmd_gc_run:
+   case GCCause::_java_lang_system_gc:
+@@ -345,6 +347,7 @@ void ZDriverMajor::collect(const ZDriverRequest& request) {
+     break;
+ 
+   case GCCause::_z_timer:
++  case GCCause::_z_freeze:
+   case GCCause::_z_warmup:
+   case GCCause::_z_allocation_rate:
+   case GCCause::_z_allocation_stall:
 diff --git a/src/hotspot/share/gc/z/zFreeze.cpp b/src/hotspot/share/gc/z/zFreeze.cpp
 new file mode 100644
-index 00000000..9260da31
+index 000000000..c8ede0f5b
 --- /dev/null
 +++ b/src/hotspot/share/gc/z/zFreeze.cpp
-@@ -0,0 +1,195 @@
+@@ -0,0 +1,194 @@
 +/*
 + * Copyright (c) 2024, Oracle and/or its affiliates. All rights reserved.
 + * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
@@ -79,21 +131,22 @@ index 00000000..9260da31
 +// HOTSPOT_BUILD_TIME, fixed when configure runs, and does not change on rebuild.
 +//
 +// Deliberately in the .cpp - a version bump must not force a header rebuild.
-+#define ZFREEZE_VERSION "v10.2"
++#define ZFREEZE_VERSION "v11.1"
++
++#include "gc/z/zGeneration.inline.hpp"
 +#include "gc/z/zHeap.inline.hpp"
-+#include "gc/z/zPage.inline.hpp"
 +#include "logging/log.hpp"
 +#include "runtime/atomic.hpp"
 +#include "runtime/os.hpp"
 +#include "runtime/safepoint.hpp"
 +#include "utilities/globalDefinitions.hpp"
 +
-+volatile int    ZFreeze::_state           = ZFreeze::Uninitialized;
++volatile int    ZFreeze::_state            = ZFreeze::Uninitialized;
 +jlong           ZFreeze::_next_poll_millis = 0;
-+size_t          ZFreeze::_frozen_pages    = 0;
-+size_t          ZFreeze::_frozen_bytes    = 0;
-+volatile size_t ZFreeze::_rooted_pages   = 0;
-+volatile size_t ZFreeze::_rooted_fields   = 0;
++size_t          ZFreeze::_frozen_pages     = 0;
++size_t          ZFreeze::_frozen_bytes     = 0;
++volatile size_t ZFreeze::_followed_pages   = 0;
++volatile size_t ZFreeze::_followed_objects = 0;
 +
 +const char* ZFreeze::state_name(int state) {
 +  switch (state) {
@@ -192,7 +245,6 @@ index 00000000..9260da31
 +    log_info(gc, heap)("ZFreeze: compacting collection started, will freeze at the next old mark end");
 +    Atomic::store(&_state, (int)Arming);
 +  }
-+
 +}
 +
 +void ZFreeze::on_old_mark_end() {
@@ -205,28 +257,27 @@ index 00000000..9260da31
 +  ZHeap::heap()->freeze_permanent_pages(&_frozen_pages, &_frozen_bytes);
 +  Atomic::store(&_state, (int)Frozen);
 +
-+
 +  log_info(gc, heap)("ZFreeze: froze " SIZE_FORMAT " page(s), " SIZE_FORMAT "M. "
 +                     "Their live maps are pinned, so marking stops at them naturally.",
 +                     _frozen_pages, _frozen_bytes / M);
 +}
 +
-+void ZFreeze::mark_permanent_roots() {
++void ZFreeze::mark_permanent_roots(ZMark* mark, ZWorkers* workers) {
 +  if (!is_frozen()) {
 +    return;
 +  }
 +
 +  size_t pages = 0;
-+  size_t fields = 0;
-+  ZHeap::heap()->mark_permanent_page_roots(&pages, &fields);
++  size_t objects = 0;
++  ZHeap::heap()->mark_permanent_page_roots(mark, workers, &pages, &objects);
 +
-+  Atomic::store(&_rooted_pages, pages);
-+  Atomic::store(&_rooted_fields, fields);
++  Atomic::store(&_followed_pages, pages);
++  Atomic::store(&_followed_objects, objects);
 +
 +  if (pages > 0) {
-+    log_info(gc, heap)("ZFreeze: scanned " SIZE_FORMAT " field(s) written into "
-+                       SIZE_FORMAT " permanent page(s) as marking roots",
-+                       fields, pages);
++    log_info(gc, heap)("ZFreeze: pushed " SIZE_FORMAT " written object(s) on "
++                       SIZE_FORMAT " permanent page(s) into old marking",
++                       objects, pages);
 +  }
 +}
 +
@@ -236,17 +287,17 @@ index 00000000..9260da31
 +  }
 +
 +  log_info(gc, heap)("ZFreeze: state=%s frozen=" SIZE_FORMAT "M/" SIZE_FORMAT " pages "
-+                     "root-scanned=" SIZE_FORMAT " fields/" SIZE_FORMAT " pages",
++                     "followed=" SIZE_FORMAT " objects/" SIZE_FORMAT " pages",
 +                     state_name(Atomic::load(&_state)),
 +                     _frozen_bytes / M, _frozen_pages,
-+                     Atomic::load(&_rooted_fields), Atomic::load(&_rooted_pages));
++                     Atomic::load(&_followed_objects), Atomic::load(&_followed_pages));
 +}
 diff --git a/src/hotspot/share/gc/z/zFreeze.hpp b/src/hotspot/share/gc/z/zFreeze.hpp
 new file mode 100644
-index 00000000..a4b1c9b8
+index 000000000..0cb4fc57f
 --- /dev/null
 +++ b/src/hotspot/share/gc/z/zFreeze.hpp
-@@ -0,0 +1,139 @@
+@@ -0,0 +1,166 @@
 +/*
 + * Copyright (c) 2024, Oracle and/or its affiliates. All rights reserved.
 + * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
@@ -274,67 +325,92 @@ index 00000000..a4b1c9b8
 +#define SHARE_GC_Z_ZFREEZE_HPP
 +
 +#include "memory/allocation.hpp"
-+
-+
 +#include "utilities/globalDefinitions.hpp"
++
++class ZMark;
++class ZWorkers;
 +
 +// ZFreeze implements a one-shot, externally triggered "freeze" of the current
 +// old generation live set into permanent pages.
 +//
-+// A permanent page (see ZPage::is_permanent()) is unconditionally live. It is
-+// never marked, never traversed by marking, never relocated and never freed.
-+// The startup-loaded working set of a long running application is typically a
-+// large, effectively immutable object graph; excluding it from marking removes
-+// it from the cost of every subsequent old collection, at the price of never
-+// reclaiming anything inside it.
++// A permanent page (see ZPage::is_permanent()) is unconditionally live: it is
++// never selected for relocation, never freed, and its live map is pinned so
++// that marking, on reaching an object on it, sees the object as already marked
++// and stops there instead of traversing its fields. The startup-loaded working
++// set of a long running application is typically a large, effectively immutable
++// object graph; excluding it from marking removes it from the cost of every
++// subsequent old collection, at the price of never reclaiming anything inside
++// it.
 +//
-+// Correctness rests on two properties:
++// Correctness rests on three properties.
 +//
-+//  1. At freeze time the frozen set is the whole live heap.
++//  1. At freeze time the frozen set is the whole live old heap.
 +//
-+//     This is not automatic and getting it wrong is fatal. The freeze is driven
-+//     by a major collection requested with a GC cause for which
-+//     should_preclean_young() is true, so ZDriverMajor::collect_young() runs
-+//     ZYoungType::major_full_preclean - "collect young generation and promote
-+//     everything to old generation" - before collect_old() reaches the old mark
-+//     start where the freeze happens. Every object that was live when the
-+//     freeze was requested is therefore in an old page by then, and freezing
-+//     all old pages freezes all of it.
++//     The freeze is driven by a major collection requested with a GC cause for
++//     which should_preclean_young() is true, so ZDriverMajor::collect_young()
++//     runs ZYoungType::major_full_preclean - "collect young generation and
++//     promote everything to old generation" - before collect_old() reaches the
++//     old mark end where the freeze happens.
 +//
-+//     Do not "optimise" this back to a cause like GCCause::_z_timer. That cause
-+//     is explicitly in the no-preclean list, the live young generation then
-+//     stays outside the snapshot, and the frozen set is born holding out-edges
-+//     whose targets get collected under it.
++//     Note that GCCause::_z_freeze is in the *unconditional* return-true group
++//     of should_preclean_young(). Causes such as GCCause::_z_timer fall through
++//     to "return ScavengeBeforeFullGC", which is true by default but is a flag
++//     the user can turn off; the freeze must not depend on it.
 +//
-+//  2. Any later reference store into a permanent page could create such an
-+//     out-edge, so the store barrier records the exact field address on that
-+//     page (ZPage::note_permanent_store()). From the next old marking cycle on,
-+//     every recorded field is handed to the mark closure as a ROOT, in
-+//     ZFreeze::mark_permanent_roots(). The record is a per-page bitmap that is
-+//     never flipped and never cleared, so it accumulates every field ever
-+//     written since the freeze.
++//  2. Every object on a frozen page that is written to after the freeze leaves
++//     the frozen set, in the sense that it is traversed again by every
++//     subsequent old marking cycle.
 +//
-+//     Roots are required here, not ordinary marking. Letting the page be marked
-+//     and traversed again would not work, because marking only ever reaches a
-+//     page by traversing a pointer to it, and a page inside the frozen set can
-+//     be reachable only from other permanent pages - which are never traversed.
-+//     Marking would simply never arrive, and the out-edge would still be
-+//     missed.
++//     This is the part that is easy to get wrong. ZGC's colour scheme encodes
++//     "how many relocations behind" a pointer is in two bits per generation,
++//     and those bits are a parity, not a version number. The scheme only works
++//     because of an invariant: between any two relocations of a generation,
++//     every pointer is visited at least once. Upstream maintains that with
++//     three mechanisms - root remapping, old marking traversal, and remembered
++//     set scanning. Freezing a page removes the second one for the pointers on
++//     it. If nothing puts it back, a pointer on a frozen page silently drifts
++//     more than one relocation behind, its parity eventually reads as "good"
++//     again, and the barrier hands out an address whose page was freed long
++//     ago.
 +//
-+//     A store that happens while old marking is already running is additionally
-+//     covered by the store barrier itself, which marks the stored value.
++//     So: the store barrier records the exact field address written
++//     (ZPage::note_permanent_store()), and at every old mark roots phase the
++//     recorded fields are converted back to their containing objects, which are
++//     pushed onto the mark stacks as *follow-only* entries. From there ZGC's own
++//     ZMark::follow_object() traverses them exactly like any other old object -
++//     which is what restores the invariant, and what makes partial array
++//     splitting, stack chunks, CLD claiming and reference discovery work
++//     without this code reimplementing any of it.
 +//
-+// The trigger is a file whose path is given by -XX:ZFreezePath. ZGC creates
-+// the file lazily and then polls it; deleting the file requests the freeze.
-+// A file is used rather than jcmd because the attach mechanism is not reliably
-+// available on all platforms.
++//     Object granularity, not field granularity, is deliberate. Field
++//     granularity would require this code to apply the mark barrier to
++//     individual fields, which bypasses all of the above - most visibly, a
++//     written java.lang.ref.Reference.referent would be marked strongly and its
++//     soft/weak/phantom semantics would be lost.
++//
++//  3. Old-to-young edges out of frozen pages keep a remembered set entry.
++//
++//     Following an object at old mark roots does not keep a young target alive:
++//     ZBarrier::mark() dispatches to young()->mark_object_if_active(), which is
++//     a no-op while young marking is not running. Young targets survive only
++//     through the remembered set, so the freeze pass explicitly registers a
++//     remembered set entry for every old-to-young edge it finds rather than
++//     assuming the store barrier already left one there.
++//
++// The trigger is a file whose path is given by -XX:ZFreezePath. ZGC creates the
++// file lazily and then polls it; deleting the file requests the freeze. A file
++// is used rather than jcmd because the attach mechanism is not reliably
++// available on all platforms, and because the request must not be affected by
++// unrelated flags: the collection is started from inside ZDirector rather than
++// through CollectedHeap::collect(), so -XX:+DisableExplicitGC (which is only
++// ever checked in JVM_GC) cannot block it.
 +//
 +// The state machine deliberately spends one full major collection compacting
 +// before it freezes, so that the pages that become permanent are densely
 +// populated and little garbage is captured:
 +//
 +//   Watching --(file deleted)--> Compacting --(old mark start)-->
-+//   Arming --(old mark start)--> Frozen
++//   Arming --(old mark end)--> Frozen
 +//
 +// Nothing inside a permanent page is ever reclaimed, so this trades memory for
 +// marking work. That is the intended trade.
@@ -354,8 +430,8 @@ index 00000000..a4b1c9b8
 +  static jlong           _next_poll_millis;
 +  static size_t          _frozen_pages;
 +  static size_t          _frozen_bytes;
-+  static volatile size_t _rooted_pages;
-+  static volatile size_t _rooted_fields;
++  static volatile size_t _followed_pages;
++  static volatile size_t _followed_objects;
 +
 +  static void initialize();
 +  static const char* state_name(int state);
@@ -368,18 +444,20 @@ index 00000000..a4b1c9b8
 +  // a major collection should be started to drive the state machine forward.
 +  static bool poll();
 +
-+  // Called at a safepoint from ZGenerationOld::mark_start(). Performs the
-+  // freeze once the state machine is armed.
++  // Called at a safepoint from ZGenerationOld::mark_start(), after the sequence
++  // number has been incremented. Re-stamps the pinned live maps and advances the
++  // state machine.
 +  static void on_old_mark_start();
 +
 +  // Called at a safepoint from ZGenerationOld::mark_end(), where marking is
 +  // complete and every live map is precise. This is where the freeze happens.
 +  static void on_old_mark_end();
 +
-+  // Called from ZGenerationOld::mark_roots(), concurrently. Feeds every
-+  // reference field of every written-to permanent page into the mark closure as
-+  // a root.
-+  static void mark_permanent_roots();
++  // Called from ZMark::mark_old_roots(), *inside* its SuspendibleThreadSetJoiner.
++  // That joiner is what keeps safepoints - and therefore colour flips, forwarding
++  // table teardown and page frees - out of the root scanning window; running this
++  // outside of it corrupts pointers.
++  static void mark_permanent_roots(ZMark* mark, ZWorkers* workers);
 +
 +  // Statistics, reported through the gc log.
 +  static void print_stats();
@@ -387,50 +465,31 @@ index 00000000..a4b1c9b8
 +
 +#endif // SHARE_GC_Z_ZFREEZE_HPP
 diff --git a/src/hotspot/share/gc/z/zGeneration.cpp b/src/hotspot/share/gc/z/zGeneration.cpp
-index 0ee5ce7a..4721b2c0 100644
+index 0ee5ce7a6..005b49205 100644
 --- a/src/hotspot/share/gc/z/zGeneration.cpp
 +++ b/src/hotspot/share/gc/z/zGeneration.cpp
-@@ -35,12 +35,15 @@
- #include "gc/z/zBreakpoint.hpp"
- #include "gc/z/zCollectedHeap.hpp"
+@@ -37,6 +37,7 @@
  #include "gc/z/zDriver.hpp"
-+#include "gc/z/zFreeze.hpp"
  #include "gc/z/zForwarding.hpp"
  #include "gc/z/zForwardingTable.inline.hpp"
 +#include "gc/z/zFreeze.hpp"
  #include "gc/z/zGeneration.inline.hpp"
  #include "gc/z/zHeap.inline.hpp"
  #include "gc/z/zJNICritical.hpp"
- #include "gc/z/zMark.inline.hpp"
-+#include "gc/z/zPage.inline.hpp"
- #include "gc/z/zPageAllocator.hpp"
- #include "gc/z/zRelocationSet.inline.hpp"
- #include "gc/z/zRelocationSetSelector.inline.hpp"
-@@ -1209,6 +1212,12 @@ void ZGenerationOld::mark_start() {
+@@ -1209,6 +1210,12 @@ void ZGenerationOld::mark_start() {
    // Increment sequence number
    _seqnum++;
  
 +  // Drive the ZFreeze state machine. Must run after retire_pages() and after
-+  // the sequence number has been incremented (so that every established old
-+  // page reports is_relocatable()), and before marking starts.
++  // the sequence number has been incremented (so that the pinned live maps are
++  // re-stamped with the new sequence number), and before marking starts.
 +  ZFreeze::on_old_mark_start();
 +  ZFreeze::print_stats();
 +
    // Enter mark phase
    set_phase(Phase::Mark);
  
-@@ -1230,6 +1239,10 @@ void ZGenerationOld::mark_start() {
- void ZGenerationOld::mark_roots() {
-   ZStatTimerOld timer(ZSubPhaseConcurrentMarkRootsOld);
-   _mark.mark_old_roots();
-+
-+  // Frozen pages are never traversed, so a reference stored into one after it
-+  // was frozen has to enter the mark closure as a root. See ZFreeze.
-+  ZFreeze::mark_permanent_roots();
- }
- 
- void ZGenerationOld::mark_follow() {
-@@ -1249,6 +1262,10 @@ bool ZGenerationOld::mark_end() {
+@@ -1249,6 +1256,10 @@ bool ZGenerationOld::mark_end() {
    // Enter mark completed phase
    set_phase(Phase::MarkComplete);
  
@@ -442,33 +501,23 @@ index 0ee5ce7a..4721b2c0 100644
    ZVerify::after_mark();
  
 diff --git a/src/hotspot/share/gc/z/zHeap.cpp b/src/hotspot/share/gc/z/zHeap.cpp
-index 21ff7037..13ada480 100644
+index 21ff70379..749f4b902 100644
 --- a/src/hotspot/share/gc/z/zHeap.cpp
 +++ b/src/hotspot/share/gc/z/zHeap.cpp
-@@ -28,18 +28,22 @@
- #include "gc/shared/locationPrinter.hpp"
- #include "gc/shared/tlab_globals.hpp"
- #include "gc/z/zAddress.inline.hpp"
-+#include "gc/z/zAllocator.inline.hpp"
- #include "gc/z/zArray.inline.hpp"
-+#include "gc/z/zBarrier.inline.hpp"
- #include "gc/z/zGeneration.inline.hpp"
- #include "gc/z/zGlobals.hpp"
+@@ -34,10 +34,12 @@
  #include "gc/z/zHeap.inline.hpp"
  #include "gc/z/zHeapIterator.hpp"
  #include "gc/z/zHeuristics.hpp"
-+#include "gc/z/zIterator.inline.hpp"
++#include "gc/z/zMark.hpp"
  #include "gc/z/zPage.inline.hpp"
  #include "gc/z/zPageTable.inline.hpp"
  #include "gc/z/zResurrection.hpp"
  #include "gc/z/zStat.hpp"
++#include "gc/z/zTask.hpp"
  #include "gc/z/zUncoloredRoot.inline.hpp"
  #include "gc/z/zUtils.hpp"
-+#include "gc/z/zUtils.inline.hpp"
  #include "gc/z/zVerify.hpp"
- #include "gc/z/zWorkers.hpp"
- #include "logging/log.hpp"
-@@ -291,6 +295,189 @@ bool ZHeap::is_allocating(zaddress addr) const {
+@@ -291,6 +293,176 @@ bool ZHeap::is_allocating(zaddress addr) const {
    return page->is_allocating();
  }
  
@@ -479,51 +528,34 @@ index 21ff7037..13ada480 100644
 +  size_t frozen_bytes = 0;
 +  size_t skipped_young_pages = 0;
 +  size_t skipped_young_bytes = 0;
-+  size_t coloured_fields = 0;
-+  size_t registered_pages = 0;
-+  size_t incomplete_pages = 0;
-+  size_t incomplete_objects = 0;
-+
-+  // Retire every allocating page first. ZGenerationOld::mark_start() already
-+  // retired the old allocator, but eden and the relocation allocators were only
-+  // retired back at the young mark start of this collection and have been
-+  // allocated into since. Freezing a page whose top is still moving would turn
-+  // everything allocated afterwards into a permanent object.
-+  ZAllocator::eden()->retire_pages();
-+  for (ZPageAge i = ZPageAge::survivor1; i <= ZPageAge::survivor14;
-+       i = static_cast<ZPageAge>(static_cast<uint>(i) + 1)) {
-+    ZAllocator::relocation(i)->retire_pages();
-+  }
++  size_t followed_objects = 0;
++  size_t remembered_fields = 0;
 +
 +  // ---------------------------------------------------------------------
 +  // Pass 1 - decide the frozen set and mark it permanent.
 +  //
-+  // The whole set must be permanent before pass 2 starts. Pass 2 decides
-+  // whether an edge leaves the frozen set by asking target->is_permanent(), so
-+  // doing both in one loop made every edge into a page later in iteration order
-+  // look like an outgoing edge. Measured with the single loop: 37.5M of 109M
-+  // reference fields registered as marking roots, all of them re-scanned on
-+  // every subsequent old marking cycle, which gives back most of what the
-+  // freeze was supposed to save.
++  // The whole set must be permanent before pass 2 starts. Pass 2 decides whether
++  // an edge leaves the frozen set by asking target->is_permanent(), so doing both
++  // in one loop would make every edge into a page later in iteration order look
++  // like an outgoing edge.
++  //
++  // ZPageTableIterator already collapses the several granules of a medium or
++  // large page into a single visit.
 +  // ---------------------------------------------------------------------
 +  {
 +    ZPageTableIterator iter(&_page_table);
 +    for (ZPage* page; iter.next(&page);) {
-+      // A medium or large page occupies several granules. Once it has been made
-+      // permanent the later granules are filtered out here.
-+      if (page->is_permanent()) {
-+        continue;
-+      }
-+
 +      if (!page->is_old()) {
 +        // By the time the freeze runs there should be very little live young
-+        // data left: the freezing major collection is requested with a cause for
-+        // which should_preclean_young() is true, so its young phase ran
-+        // ZYoungType::major_full_preclean and promoted every live object into
-+        // the old generation. What remains was allocated after the pre-clean.
++        // data left: the freezing major collection is requested with
++        // GCCause::_z_freeze, for which should_preclean_young() unconditionally
++        // returns true, so its young phase ran ZYoungType::major_full_preclean
++        // and promoted every live object into the old generation. What remains
++        // was allocated after the pre-clean.
 +        //
 +        // Whatever is left is genuinely outside the snapshot, which is exactly
-+        // why pass 2 registers edges pointing into it.
++        // why pass 2 registers edges pointing into it - both as objects to keep
++        // following, and as remembered set entries.
 +        skipped_young_pages++;
 +        skipped_young_bytes += page->size();
 +        continue;
@@ -532,13 +564,6 @@ index 21ff7037..13ada480 100644
 +      if (!page->is_relocatable()) {
 +        // Still being allocated into. Freezing it would silently turn every
 +        // object allocated afterwards into a permanent object as top moves on.
-+        continue;
-+      }
-+
-+      size_t page_uncolourable = 0;
-+      if (!page->can_be_frozen(&page_uncolourable)) {
-+        incomplete_pages++;
-+        incomplete_objects += page_uncolourable;
 +        continue;
 +      }
 +
@@ -551,43 +576,32 @@ index 21ff7037..13ada480 100644
 +  }
 +
 +  // ---------------------------------------------------------------------
-+  // Pass 2 - re-colour the frozen set and register the edges leaving it.
++  // Pass 2 - classify the frozen set.
 +  // ---------------------------------------------------------------------
 +  {
-+    ZPage* previous = nullptr;
 +    ZPageTableIterator iter(&_page_table);
 +    for (ZPage* page; iter.next(&page);) {
-+      // Every page in the set is permanent now, so is_permanent() can no longer
-+      // serve as the multi-granule filter.
-+      if (page == previous) {
-+        continue;
-+      }
-+      previous = page;
-+
 +      if (!page->is_permanent()) {
 +        continue;
 +      }
 +
-+      coloured_fields += page->prepare_permanent_colours();
-+      registered_pages++;
++      size_t objects = 0;
++      size_t remembered = 0;
++      page->classify_permanent_fields(&objects, &remembered);
++
++      followed_objects += objects;
++      remembered_fields += remembered;
 +    }
 +  }
 +
-+  log_info(gc, heap)("ZFreeze: re-coloured " SIZE_FORMAT " reference field(s) on "
-+                     SIZE_FORMAT " page(s) so that post-freeze stores take the "
-+                     "barrier slow path", coloured_fields, registered_pages);
-+
-+  if (incomplete_pages > 0) {
-+    log_warning(gc)("ZFreeze: " SIZE_FORMAT " page(s) NOT frozen because " SIZE_FORMAT
-+                    " object(s) could not be re-coloured (forwarded object arrays). "
-+                    "Leaving them out is deliberate; a partially coloured page would "
-+                    "hide out-edges.", incomplete_pages, incomplete_objects);
-+  }
++  log_info(gc, heap)("ZFreeze: " SIZE_FORMAT " object(s) already hold edges out of the "
++                     "frozen set and will keep being traversed; " SIZE_FORMAT
++                     " remembered set entry(s) registered for old-to-young edges",
++                     followed_objects, remembered_fields);
 +
 +  if (skipped_young_pages > 0) {
 +    log_info(gc, heap)("ZFreeze: skipped " SIZE_FORMAT " young page(s), " SIZE_FORMAT
-+                       "M committed, allocated after the pre-clean. Edges from the "
-+                       "frozen set into them are registered as marking roots.",
++                       "M committed, allocated after the pre-clean",
 +                       skipped_young_pages, skipped_young_bytes / M);
 +  }
 +
@@ -598,106 +612,131 @@ index 21ff7037..13ada480 100644
 +void ZHeap::refresh_permanent_livemaps() {
 +  assert(SafepointSynchronize::is_at_safepoint(), "Should be at safepoint");
 +
-+  ZPage* previous = nullptr;
 +  ZPageTableIterator iter(&_page_table);
 +  for (ZPage* page; iter.next(&page);) {
-+    if (page == previous) {
-+      continue;
-+    }
-+    previous = page;
 +    if (page->is_permanent()) {
 +      page->keep_livemap_current();
 +    }
 +  }
 +}
 +
-+void ZHeap::mark_permanent_page_roots(size_t* pages, size_t* fields) {
-+  assert(ZGeneration::old()->is_phase_mark(), "Should be marking the old generation");
++// Feeds every object that has been written to since the freeze into old marking.
++//
++// This is a ZTask run on the old generation's workers rather than work done
++// inline on the driver thread. Two reasons, both load bearing:
++//
++//  - It must be parallel and claimable, because the recorded set grows without
++//    bound over the life of the process.
++//
++//  - It must not iterate the page table with a bare ZPageTableIterator while
++//    pages can be freed underneath it. ZGenerationPagesParallelIterator holds
++//    enable_safe_destroy()/enable_safe_recycle() for its lifetime, which is what
++//    every other concurrent page table walk in ZGC does.
++class ZFreezeRootsTask : public ZTask {
++private:
++  ZMark* const                     _mark;
++  ZGenerationPagesParallelIterator _iterator;
++  volatile size_t                  _pages;
++  volatile size_t                  _objects;
 +
-+  size_t scanned_pages = 0;
-+  size_t scanned_fields = 0;
++public:
++  ZFreezeRootsTask(ZMark* mark, ZPageTable* page_table, ZPageAllocator* page_allocator)
++    : ZTask("ZFreezeRootsTask"),
++      _mark(mark),
++      _iterator(page_table, ZGenerationId::old, page_allocator),
++      _pages(0),
++      _objects(0) {}
 +
-+  ZPage* previous = nullptr;
++  virtual void work() {
++    size_t pages = 0;
++    size_t objects = 0;
 +
-+  ZPageTableIterator iter(&_page_table);
-+  for (ZPage* page; iter.next(&page);) {
-+    // A medium or large page occupies several granules, so guard against
-+    // scanning the same page more than once.
-+    if (page == previous) {
-+      continue;
-+    }
-+    previous = page;
++    _iterator.do_pages([&](ZPage* page) {
++      if (page->is_permanent() && page->is_permanent_written()) {
++        page->object_do_permanent_written([&](oop obj) {
++          _mark->push_follow_only(to_zaddress(obj));
++          objects++;
++        });
++        pages++;
++      }
 +
-+    if (!page->is_permanent() || !page->is_permanent_written()) {
-+      continue;
-+    }
-+
-+    // This page received one or more reference stores after it was frozen, so it
-+    // may hold out-edges into collectable space. Nothing traverses a permanent
-+    // page, so those fields have to enter the mark closure as roots.
-+    //
-+    // Note that this walks the recorded FIELDS, not the objects. Walking objects
-+    // would mean reproducing ZMark::follow_object - object alignment per page
-+    // type, the CLD-claiming and reference-discovering follow closure, the
-+    // stack chunk special case, and the split handling for large object arrays.
-+    // The store barrier already recorded the exact field addresses, so none of
-+    // that is needed, and the cost is proportional to the number of fields
-+    // actually written rather than to the size of the page.
-+    page->oops_do_permanent_writes([&](volatile zpointer* p) {
-+      ZBarrier::mark_barrier_on_oop_field(p, false /* finalizable */);
-+      scanned_fields++;
++      return true;
 +    });
 +
-+    scanned_pages++;
++    Atomic::add(&_pages, pages);
++    Atomic::add(&_objects, objects);
++
++    // The set of workers executing during root scanning can be different from
++    // the set executing during marking, so publish what was pushed. Same reason
++    // as ZMarkOldRootsTask.
++    ZHeap::heap()->mark_flush_and_free(Thread::current());
 +  }
 +
-+  *pages = scanned_pages;
-+  *fields = scanned_fields;
++  size_t pages() const {
++    return Atomic::load(&_pages);
++  }
++
++  size_t objects() const {
++    return Atomic::load(&_objects);
++  }
++};
++
++void ZHeap::mark_permanent_page_roots(ZMark* mark, ZWorkers* workers, size_t* pages, size_t* objects) {
++  assert(ZGeneration::old()->is_phase_mark(), "Should be marking the old generation");
++
++  ZFreezeRootsTask task(mark, &_page_table, &_page_allocator);
++  workers->run(&task);
++
++  *pages = task.pages();
++  *objects = task.objects();
 +}
 +
  void ZHeap::object_iterate(ObjectClosure* object_cl, bool visit_weaks) {
    assert(SafepointSynchronize::is_at_safepoint(), "Should be at safepoint");
    ZHeapIterator iter(1 /* nworkers */, visit_weaks, false /* for_verify */);
 diff --git a/src/hotspot/share/gc/z/zHeap.hpp b/src/hotspot/share/gc/z/zHeap.hpp
-index 18fa0d63..728176a0 100644
+index 18fa0d634..6d8343883 100644
 --- a/src/hotspot/share/gc/z/zHeap.hpp
 +++ b/src/hotspot/share/gc/z/zHeap.hpp
-@@ -105,6 +105,11 @@ public:
-   ZPage* alloc_page(ZPageType type, size_t size, ZAllocationFlags flags, ZPageAge age);
-   void undo_alloc_page(ZPage* page);
+@@ -35,6 +35,8 @@
+ #include "gc/z/zServiceability.hpp"
+ 
+ class OopFieldClosure;
++class ZMark;
++class ZWorkers;
+ 
+ class ZHeap {
+   friend class ZForwardingTest;
+@@ -107,6 +109,12 @@ public:
    void free_page(ZPage* page);
-+
-+  // ZFreeze support. Both must be called at a safepoint.
-+  void freeze_permanent_pages(size_t* pages, size_t* bytes);
-+  void mark_permanent_page_roots(size_t* pages, size_t* fields);
-+  void refresh_permanent_livemaps();
    size_t free_empty_pages(const ZArray<ZPage*>* pages);
  
++  // ZFreeze. The first two must be called at a safepoint. The third must be
++  // called from ZMark::mark_old_roots(), inside its SuspendibleThreadSetJoiner.
++  void freeze_permanent_pages(size_t* pages, size_t* bytes);
++  void refresh_permanent_livemaps();
++  void mark_permanent_page_roots(ZMark* mark, ZWorkers* workers, size_t* pages, size_t* objects);
++
    // Object allocation
+   bool is_alloc_stalling() const;
+   bool is_alloc_stalling_for_old() const;
 diff --git a/src/hotspot/share/gc/z/zLiveMap.hpp b/src/hotspot/share/gc/z/zLiveMap.hpp
-index e3bcd2e2..c7decf7a 100644
+index e3bcd2e26..7dee87ce9 100644
 --- a/src/hotspot/share/gc/z/zLiveMap.hpp
 +++ b/src/hotspot/share/gc/z/zLiveMap.hpp
-@@ -66,6 +66,7 @@ private:
-   bool claim_segment(BitMap::idx_t segment);
- 
-   void reset(ZGenerationId id);
-+
-   void reset_segment(BitMap::idx_t segment);
- 
-   size_t do_object(ObjectClosure* cl, zaddress addr) const;
-@@ -74,6 +75,9 @@ private:
+@@ -74,6 +74,10 @@ private:
    void iterate_segment(BitMap::idx_t segment, Function function);
  
  public:
 +  // ZFreeze: keep this live map permanently valid by re-stamping it with the
 +  // generation's current sequence number, so reset_if_stale() never wipes it.
 +  void refresh_seqnum(ZGenerationId id);
++
    ZLiveMap(uint32_t size);
    ZLiveMap(const ZLiveMap& other) = delete;
  
 diff --git a/src/hotspot/share/gc/z/zLiveMap.inline.hpp b/src/hotspot/share/gc/z/zLiveMap.inline.hpp
-index 28390b72..d23a560c 100644
+index 28390b72a..d23a560c1 100644
 --- a/src/hotspot/share/gc/z/zLiveMap.inline.hpp
 +++ b/src/hotspot/share/gc/z/zLiveMap.inline.hpp
 @@ -43,6 +43,10 @@ inline bool ZLiveMap::is_marked(ZGenerationId id) const {
@@ -711,23 +750,111 @@ index 28390b72..d23a560c 100644
  inline uint32_t ZLiveMap::live_objects() const {
    return _live_objects;
  }
+diff --git a/src/hotspot/share/gc/z/zMark.cpp b/src/hotspot/share/gc/z/zMark.cpp
+index 8bfca55a6..df06b9d8e 100644
+--- a/src/hotspot/share/gc/z/zMark.cpp
++++ b/src/hotspot/share/gc/z/zMark.cpp
+@@ -35,6 +35,7 @@
+ #include "gc/z/zAddress.inline.hpp"
+ #include "gc/z/zBarrier.inline.hpp"
+ #include "gc/z/zBarrierSetNMethod.hpp"
++#include "gc/z/zFreeze.hpp"
+ #include "gc/z/zGeneration.inline.hpp"
+ #include "gc/z/zGenerationId.hpp"
+ #include "gc/z/zHeap.inline.hpp"
+@@ -52,6 +53,7 @@
+ #include "gc/z/zStat.hpp"
+ #include "gc/z/zTask.hpp"
+ #include "gc/z/zThreadLocalAllocBuffer.hpp"
++#include "gc/z/zThreadLocalData.hpp"
+ #include "gc/z/zUncoloredRoot.inline.hpp"
+ #include "gc/z/zUtils.inline.hpp"
+ #include "gc/z/zWorkers.hpp"
+@@ -954,10 +956,41 @@ void ZMark::mark_young_roots() {
+   workers()->run(&task);
+ }
+ 
++void ZMark::push_follow_only(zaddress addr) {
++  assert(_generation->is_old(), "Only the old generation freezes pages");
++  assert(_generation->is_phase_mark(), "Marking not started");
++
++  ZMarkThreadLocalStacks* const stacks = ZThreadLocalData::mark_stacks(Thread::current(), _generation->id());
++  ZMarkStripe* const stripe = _stripes.stripe_for_addr(untype(addr));
++  const ZMarkStackEntry entry(untype(ZAddress::offset(addr)),
++                              false /* mark */,
++                              false /* inc_live */,
++                              true  /* follow */,
++                              false /* finalizable */);
++
++  stacks->push(&_allocator, &_stripes, stripe, &_terminate, entry, false /* publish */);
++}
++
+ void ZMark::mark_old_roots() {
+   SuspendibleThreadSetJoiner sts_joiner;
+-  ZMarkOldRootsTask task(this);
+-  workers()->run(&task);
++
++  {
++    ZMarkOldRootsTask task(this);
++    workers()->run(&task);
++  }
++
++  // Objects on frozen pages that have been written to since the freeze have to
++  // be pushed onto the mark stacks explicitly, because nothing traverses a
++  // frozen page.
++  //
++  // This must stay inside the joiner above. The joiner is held by this thread
++  // for the whole of root scanning and never yields, and
++  // ZCollectedHeap::safepoint_synchronize_begin() calls
++  // SuspendibleThreadSet::synchronize(), so no safepoint can begin until root
++  // scanning is done. That is what keeps colour flips, forwarding table teardown
++  // and page frees out of this window - which is exactly what upstream relies on
++  // for ZMarkOldRootsTask, and why that task does not join the set itself.
++  ZFreeze::mark_permanent_roots(this, workers());
+ }
+ 
+ void ZMark::mark_follow() {
+diff --git a/src/hotspot/share/gc/z/zMark.hpp b/src/hotspot/share/gc/z/zMark.hpp
+index 552bf3b95..bd061f750 100644
+--- a/src/hotspot/share/gc/z/zMark.hpp
++++ b/src/hotspot/share/gc/z/zMark.hpp
+@@ -106,6 +106,13 @@ public:
+   template <bool resurrect, bool gc_thread, bool follow, bool finalizable>
+   void mark_object(zaddress addr);
+ 
++  // ZFreeze: push an object that must be traversed again even though its live
++  // map bit is already set. The entry carries mark=false, so mark_and_follow()
++  // does not consult the (pinned) live map and does not swallow it as "already
++  // marked", and inc_live=false, so the pinned live byte accounting of the page
++  // is not inflated on every cycle.
++  void push_follow_only(zaddress addr);
++
+   void start();
+   void mark_young_roots();
+   void mark_old_roots();
 diff --git a/src/hotspot/share/gc/z/zPage.cpp b/src/hotspot/share/gc/z/zPage.cpp
-index 318b2417..d63e633e 100644
+index 318b2417e..ee44bd3f9 100644
 --- a/src/hotspot/share/gc/z/zPage.cpp
 +++ b/src/hotspot/share/gc/z/zPage.cpp
-@@ -25,6 +25,12 @@
+@@ -23,12 +23,18 @@
+ 
+ #include "precompiled.hpp"
  #include "gc/shared/gc_globals.hpp"
- #include "gc/z/zGeneration.inline.hpp"
- #include "gc/z/zList.inline.hpp"
 +#include "gc/z/zBarrier.inline.hpp"
+ #include "gc/z/zGeneration.inline.hpp"
 +#include "gc/z/zHeap.inline.hpp"
 +#include "gc/z/zIterator.inline.hpp"
-+#include "oops/oop.inline.hpp"
-+#include "runtime/safepoint.hpp"
-+#include "runtime/atomic.hpp"
+ #include "gc/z/zList.inline.hpp"
  #include "gc/z/zPage.inline.hpp"
  #include "gc/z/zPhysicalMemory.inline.hpp"
  #include "gc/z/zRememberedSet.inline.hpp"
+ #include "gc/z/zVirtualMemory.inline.hpp"
++#include "oops/oop.inline.hpp"
++#include "runtime/atomic.hpp"
++#include "runtime/safepoint.hpp"
+ #include "utilities/align.hpp"
+ #include "utilities/debug.hpp"
+ #include "utilities/growableArray.hpp"
 @@ -46,7 +52,10 @@ ZPage::ZPage(ZPageType type, const ZVirtualMemory& vmem, const ZPhysicalMemory&
      _remembered_set(),
      _last_used(0),
@@ -740,41 +867,42 @@ index 318b2417..d63e633e 100644
    assert(!_virtual.is_null(), "Should not be null");
    assert(!_physical.is_null(), "Should not be null");
    assert(_virtual.size() == _physical.size(), "Virtual/Physical size mismatch");
-@@ -143,6 +152,15 @@ void ZPage::reset(ZPageAge age, ZPageResetType type) {
+@@ -143,6 +152,18 @@ void ZPage::reset(ZPageAge age, ZPageResetType type) {
    _age = age;
    _last_used = 0;
  
-+  // A permanent page is excluded from the relocation set and is therefore
-+  // never reset or recycled. Clear the flags defensively anyway: losing the
-+  // permanent property is harmless (the page simply becomes an ordinary old
-+  // page again), whereas a recycled page that wrongly kept it would never be
-+  // marked and never be reclaimed.
++  // A permanent page is excluded from the relocation set and is therefore never
++  // reset or recycled. Clear the state defensively anyway, and release the write
++  // set: losing the permanent property is harmless (the page simply becomes an
++  // ordinary page again), whereas a recycled page that wrongly kept it would
++  // never be marked and never be reclaimed.
 +  assert(!is_permanent(), "Permanent page must not be reset");
 +  Atomic::store(&_permanent, false);
 +  Atomic::store(&_permanent_written, false);
++  if (_permanent_writes.size() != 0) {
++    _permanent_writes.resize(0);
++  }
 +
    _generation_id = age == ZPageAge::old
        ? ZGenerationId::old
        : ZGenerationId::young;
-@@ -315,3 +333,127 @@ void ZPage::fatal_msg(const char* msg) const {
+@@ -315,3 +336,129 @@ void ZPage::fatal_msg(const char* msg) const {
    print_on_msg(&ss, msg);
    fatal("%s", ss.base());
  }
 +
 +// ---------------------------------------------------------------------------
-+// ZFreeze. These run once at the freeze safepoint (or once per old mark
-+// start), never on a hot path, so they live here rather than in
-+// zPage.inline.hpp. Keeping them out of the header means iterating on the
-+// freeze algorithm no longer forces a full HotSpot rebuild.
++// ZFreeze. These run once at the freeze safepoint (or once per old mark start),
++// never on a hot path, so they live here rather than in zPage.inline.hpp.
 +// ---------------------------------------------------------------------------
 +
 +void ZPage::init_permanent_write_set() {
 +  assert(SafepointSynchronize::is_at_safepoint(), "Must be at safepoint");
 +
-+  // Must run BEFORE prepare_permanent_colours(): that pass records freeze-time
-+  // out-edges through note_permanent_store(), which writes into this bitmap.
-+  // One bit per possible oop slot, same layout as the remembered set. Never
-+  // flipped, never cleared.
++  // Must run BEFORE classify_permanent_fields(): that pass records the objects
++  // that already hold out-edges at freeze time through note_permanent_store(),
++  // which writes into this bitmap. One bit per possible oop slot, same layout as
++  // the remembered set. Never flipped, never cleared.
 +  _permanent_writes.initialize(ZRememberedSet::to_bit_size(size()), true /* clear */);
 +  Atomic::store(&_permanent_written, false);
 +}
@@ -782,142 +910,144 @@ index 318b2417..d63e633e 100644
 +void ZPage::make_permanent() {
 +  assert(SafepointSynchronize::is_at_safepoint(), "Must be at safepoint");
 +  assert(!is_permanent(), "Already permanent");
-+
 +  guarantee(_permanent_writes.size() != 0, "init_permanent_write_set() must run first");
-+
 +
 +  Atomic::store(&_permanent_written, false);
 +  Atomic::store(&_permanent, true);
 +}
 +
-+bool ZPage::can_be_frozen(size_t* uncolourable) {
-+  assert(SafepointSynchronize::is_at_safepoint(), "Must be at safepoint");
-+  assert(is_marked(), "Live map must be valid - freeze runs at old mark end");
-+
-+  // Header-only walk. ZIterator::oop_iterate_safe() silently skips objects whose
-+  // mark word currently holds a forwarding pointer, so a page containing one
-+  // cannot be fully re-coloured, and a partially coloured page keeps store-good
-+  // fields whose stores are invisible to the freeze machinery. Such a page is
-+  // left out of the frozen set entirely.
-+  //
-+  // This has to be a separate pass. Eligibility for the whole frozen set must be
-+  // final before any colouring starts, because the colour pass decides whether
-+  // an edge leaves the set by asking target->is_permanent(). Un-freezing a page
-+  // after other pages have already been coloured is not possible: edges into it
-+  // would have been treated as internal and never registered as roots.
-+  size_t bad = 0;
-+
-+  object_iterate([&](oop obj) {
-+    if (obj->klass()->is_objArray_klass() && obj->mark_acquire().is_marked()) {
-+      bad++;
-+    }
-+  });
-+
-+  *uncolourable = bad;
-+
-+  return bad == 0;
-+}
-+
-+size_t ZPage::prepare_permanent_colours() {
++void ZPage::classify_permanent_fields(size_t* followed_objects, size_t* remembered_fields) {
 +  assert(SafepointSynchronize::is_at_safepoint(), "Must be at safepoint");
 +  assert(is_permanent(), "Whole frozen set must be marked permanent first");
-+  assert(is_marked(), "Live map must be valid - freeze runs at old mark end");
++  assert(is_marked(), "Live map must be valid - the freeze runs at old mark end");
++
++  size_t objects = 0;
++  size_t remembered = 0;
 +
 +  // Walk LIVE objects only, via ZGC's own live-map driven iterator. Walking the
 +  // page linearly from start() to top() would also touch dead objects, whose
-+  // fields hold long-stale pointers; applying a barrier to those manufactures
-+  // good-coloured pointers into freed pages.
-+  size_t coloured = 0;
-+
++  // fields hold long-stale pointers.
 +  object_iterate([&](oop obj) {
-+    guarantee(!(obj->klass()->is_objArray_klass() && obj->mark_acquire().is_marked()),
-+              "can_be_frozen() should have excluded this page");
++    // An object array whose mark word currently holds a forwarding pointer
++    // cannot be walked (ZIterator::oop_iterate_safe() skips exactly these). Do
++    // not try to classify it - register it unconditionally instead, so that it
++    // keeps being traversed by normal marking from now on. This is strictly
++    // safer than the alternative of leaving the whole page out of the frozen
++    // set, and it cannot lose an out-edge.
++    if (obj->klass()->is_objArray_klass() && obj->mark_acquire().is_marked()) {
++      note_permanent_store((volatile zpointer*)untype(to_zaddress(obj)));
++      objects++;
++      return;
++    }
 +
-+    ZIterator::basic_oop_iterate_safe(obj, [&](volatile zpointer* p) {
-+      // Remap and re-colour. load_barrier_on_oop_field() remaps through the
-+      // forwarding tables and self-heals via ZAddress::load_good(), which sets
-+      // ZPointerRememberedMask - both remembered bits. That is always store-bad,
-+      // because ZPointerStoreBadMask carries the other one, so the next store to
-+      // this field is forced onto the slow path where ZPage::remember() and
-+      // note_permanent_store() run. The field stays load-good and mark-good, so
-+      // application reads keep the fast path.
-+      const zaddress addr = ZBarrier::load_barrier_on_oop_field(p);
++    bool needs_follow = false;
 +
-+      // Then record any edge that ALREADY leaves the frozen set.
-+      //
-+      // Such an edge was not produced by a post-freeze store, so the store
-+      // barrier will never report it. While its target is young the remembered
-+      // set covers it, but the moment the target is promoted
-+      // ZRemembered::scan_field() drops the entry - it only re-registers targets
-+      // that are still young - and then nothing knows the edge exists. The
-+      // target is eventually collected while a frozen field still points at it,
-+      // and the next store to that field takes the store barrier slow path,
-+      // buffers the stale value, and ZStoreBarrierBuffer::flush() dereferences a
-+      // page table entry that is now nullptr.
-+      //
-+      // The test is target->is_permanent(), which is why the whole frozen set
-+      // has to be marked permanent before this pass runs. Testing it while pages
-+      // were still being marked one at a time made every edge into a
-+      // not-yet-processed page look outgoing: 37.5M of 109M fields registered as
-+      // roots, re-scanned on every later old marking cycle.
-+      if (!is_null(addr)) {
-+        const ZPage* const target = ZHeap::heap()->page(addr);
-+        if (target == nullptr || !target->is_permanent()) {
-+          note_permanent_store(p);
-+        }
++    ZIterator::basic_oop_iterate(obj, [&](volatile zpointer* p) {
++      const zpointer o = Atomic::load(p);
++      if (is_null_any(o)) {
++        return;
 +      }
 +
-+      coloured++;
++      // A field that is currently store good was written during the old marking
++      // cycle that is ending right now - that is, before this page became
++      // permanent, so the store barrier never reported it, and any further store
++      // to it within the same colour epoch takes the store barrier fast path and
++      // will not report it either. Register its object now; that is the only
++      // thing that closes this window.
++      //
++      // Every other field is already store bad, because old marking just healed
++      // it with ZAddress::mark_good(), which sets both remembered bits while
++      // ZPointerStoreGoodMask carries only one. So the next store to it takes the
++      // slow path and reaches ZPage::remember(). There is deliberately no
++      // re-colouring pass here: it would be a no-op for those fields, and for
++      // the store good ones a barrier would not have helped anyway, since
++      // ZBarrier::barrier() returns from its fast path without healing when the
++      // pointer is already load good.
++      if (ZPointer::is_store_good(o)) {
++        needs_follow = true;
++      }
++
++      const zaddress addr = ZPointer::is_load_good(o)
++          ? ZPointer::uncolor(o)
++          : ZBarrier::load_barrier_on_oop_field(p);
++      if (is_null(addr)) {
++        return;
++      }
++
++      const ZPage* const target = ZHeap::heap()->page(addr);
++      if (target != nullptr && target->is_permanent()) {
++        // Inside the frozen set. The target never moves and is unconditionally
++        // live, so this edge needs no maintenance at all.
++        return;
++      }
++
++      // An edge that already leaves the frozen set. It was not produced by a
++      // post-freeze store, so the store barrier will never report it.
++      needs_follow = true;
++
++      if (target != nullptr && target->is_young()) {
++        // Following the object at old mark roots does not keep a young target
++        // alive - ZBarrier::mark() dispatches to young()->mark_object_if_active(),
++        // which does nothing while young marking is not running. Only the
++        // remembered set can keep it alive, so register the entry explicitly
++        // rather than assuming the store barrier already left one behind.
++        _remembered_set.set_current(local_offset(to_zaddress((uintptr_t)p)));
++        remembered++;
++      }
 +    });
++
++    if (needs_follow) {
++      note_permanent_store((volatile zpointer*)untype(to_zaddress(obj)));
++      objects++;
++    }
 +  });
 +
-+  return coloured;
++  *followed_objects = objects;
++  *remembered_fields = remembered;
 +}
 +
 +void ZPage::keep_livemap_current() {
 +  assert(SafepointSynchronize::is_at_safepoint(), "Must be at safepoint");
 +  assert(is_permanent(), "Only permanent pages");
-+  // ZLiveMap::is_marked() is just _seqnum == generation->seqnum(). Re-stamping
-+  // it every old mark start keeps the frozen live map valid forever, so
-+  // is_marked(), live_bytes(), find_base(), object_iterate() and the
-+  // ZRemembered::scan_page() branch selection all keep working. That is what
-+  // removes the need for the special cases this patch used to carry.
++
++  // ZLiveMap::is_marked() is just _seqnum == generation->seqnum(). Re-stamping it
++  // every old mark start keeps the frozen live map valid forever, so is_marked(),
++  // live_bytes(), find_base(), object_iterate() and the ZRemembered::scan_page()
++  // branch selection all keep working without special cases.
 +  _livemap.refresh_seqnum(generation_id());
 +}
 diff --git a/src/hotspot/share/gc/z/zPage.hpp b/src/hotspot/share/gc/z/zPage.hpp
-index e07b338c..66249640 100644
+index e07b338c7..b1890a3b8 100644
 --- a/src/hotspot/share/gc/z/zPage.hpp
 +++ b/src/hotspot/share/gc/z/zPage.hpp
-@@ -67,6 +67,28 @@ private:
-   uint64_t             _last_used;
+@@ -68,6 +68,26 @@ private:
    ZPhysicalMemory      _physical;
    ZListNode<ZPage>     _node;
+ 
 +  // ZFreeze: permanent (frozen) page support.
 +  //
-+  // A permanent page is unconditionally live. It is never marked, never
-+  // traversed by marking, never relocated and never freed.
++  // A permanent page is unconditionally live. It is never selected for
++  // relocation and never freed, and its live map is pinned, so marking that
++  // reaches an object on it sees the object as already marked and stops there
++  // instead of traversing its fields.
 +  //
-+  // A reference store into a permanent page may create an out-edge that marking
-+  // would never discover, because nothing traverses a permanent page. The store
-+  // barrier therefore records the exact field address in _permanent_writes, and
-+  // every recorded field is fed into the mark closure as a ROOT at the start of
-+  // every old marking cycle.
-+  //
-+  // Roots are required here, not ordinary marking: marking only ever reaches a
-+  // page by traversing a pointer to it, and a page inside the frozen set can be
-+  // reachable only from other permanent pages, which are never traversed.
-+  //
-+  // _permanent_writes uses the same one-bit-per-oop-slot layout as the
-+  // remembered set (see ZRememberedSet::to_index), but unlike the remembered set
-+  // it is never flipped and never cleared, so it accumulates every field ever
-+  // written since the freeze. It is allocated lazily, in make_permanent().
++  // _permanent_writes records, one bit per possible oop slot (the same layout as
++  // the remembered set, see ZRememberedSet::to_index), every field on this page
++  // that has been written since the freeze. It is never flipped and never
++  // cleared, so it accumulates. At every old mark roots phase the recorded
++  // fields are converted back to their containing objects - the bits are visited
++  // in ascending offset order and objects do not interleave, so one
++  // find_base_unsafe() call covers all recorded fields of an object - and those
++  // objects are pushed onto the mark stacks as follow-only entries. From there
++  // ZGC's own ZMark::follow_object() traverses them like any other old object.
 +  volatile bool        _permanent;
 +  volatile bool        _permanent_written;
 +  ZMovableBitMap       _permanent_writes;
- 
++
    ZPageType type_from_size(size_t size) const;
    const char* type_to_string() const;
-@@ -125,6 +147,27 @@ public:
+ 
+@@ -125,6 +145,23 @@ public:
    bool is_allocating() const;
    bool is_relocatable() const;
  
@@ -929,51 +1059,39 @@ index e07b338c..66249640 100644
 +  void note_permanent_store(volatile zpointer* p);
 +  void keep_livemap_current();
 +
-+  // Visit every field of this page that has been written since the freeze.
-+  template <typename Function /* void(volatile zpointer*) */>
-+  void oops_do_permanent_writes(Function function);
++  // Freeze pass 2: decide which objects on this frozen page must keep being
++  // traversed, and make sure every old-to-young edge found has a remembered set
++  // entry. Runs once, at the freeze safepoint.
++  void classify_permanent_fields(size_t* followed_objects, size_t* remembered_fields);
 +
-+  // Freeze pass 1: can every object on this page be re-coloured? Header-only
-+  // walk, no fields touched. A page that answers false must not be frozen.
-+  bool can_be_frozen(size_t* uncolourable);
-+
-+  // Freeze pass 2: re-colour every reference field so the next store to it is
-+  // forced onto the store barrier slow path, and register the edges that
-+  // already leave the frozen set. Returns the number of fields visited.
-+  size_t prepare_permanent_colours();
++  // Visit every object on this page that has been written to since the freeze.
++  template <typename Function /* void(oop) */>
++  void object_do_permanent_written(Function function);
 +
    uint64_t last_used() const;
    void set_last_used();
  
 diff --git a/src/hotspot/share/gc/z/zPage.inline.hpp b/src/hotspot/share/gc/z/zPage.inline.hpp
-index 6cacf699..3fe3f36f 100644
+index 6cacf6991..c15f00a83 100644
 --- a/src/hotspot/share/gc/z/zPage.inline.hpp
 +++ b/src/hotspot/share/gc/z/zPage.inline.hpp
-@@ -27,8 +27,11 @@
- #include "gc/z/zPage.hpp"
- 
+@@ -29,6 +29,7 @@
  #include "gc/z/zAddress.inline.hpp"
-+#include "gc/z/zBarrier.inline.hpp"
  #include "gc/z/zGeneration.inline.hpp"
  #include "gc/z/zGlobals.hpp"
 +#include "gc/z/zHeap.inline.hpp"
-+#include "gc/z/zIterator.inline.hpp"
  #include "gc/z/zLiveMap.inline.hpp"
  #include "gc/z/zNUMA.hpp"
  #include "gc/z/zPhysicalMemory.inline.hpp"
-@@ -36,8 +39,11 @@
+@@ -36,6 +37,7 @@
  #include "gc/z/zUtils.inline.hpp"
  #include "gc/z/zVirtualMemory.inline.hpp"
  #include "logging/logStream.hpp"
 +#include "oops/oop.inline.hpp"
-+#include "oops/klass.hpp"
  #include "runtime/atomic.hpp"
  #include "runtime/os.hpp"
-+#include "runtime/safepoint.hpp"
  #include "utilities/align.hpp"
- #include "utilities/debug.hpp"
- 
-@@ -202,6 +208,48 @@ inline bool ZPage::is_relocatable() const {
+@@ -202,6 +204,67 @@ inline bool ZPage::is_relocatable() const {
    return _seqnum < generation()->seqnum();
  }
  
@@ -985,20 +1103,15 @@ index 6cacf699..3fe3f36f 100644
 +  return Atomic::load(&_permanent_written);
 +}
 +
-+
-+
-+
-+
-+
 +inline void ZPage::note_permanent_store(volatile zpointer* p) {
-+  const uintptr_t local_offset = ZPage::local_offset(to_zaddress((uintptr_t)p));
++  const uintptr_t l_offset = local_offset(to_zaddress((uintptr_t)p));
 +
 +  // Called from store barrier paths, concurrently. par_set_bit is atomic and the
 +  // bit is never cleared, so a bit that appears while the page is being scanned
 +  // is simply picked up by the next old marking cycle - and a store made while
-+  // old marking is running has already had its value marked by the store barrier
-+  // itself.
-+  _permanent_writes.par_set_bit(ZRememberedSet::to_index(local_offset), memory_order_relaxed);
++  // old marking is already running has had its previous value marked by the
++  // store barrier itself.
++  _permanent_writes.par_set_bit(ZRememberedSet::to_index(l_offset), memory_order_relaxed);
 +
 +  if (!Atomic::load(&_permanent_written)) {
 +    Atomic::store(&_permanent_written, true);
@@ -1006,14 +1119,38 @@ index 6cacf699..3fe3f36f 100644
 +}
 +
 +template <typename Function>
-+inline void ZPage::oops_do_permanent_writes(Function function) {
++inline void ZPage::object_do_permanent_written(Function function) {
 +  assert(is_permanent(), "Only permanent pages have a write set");
 +
-+  _permanent_writes.iterate([&](BitMap::idx_t index) {
-+    const zoffset offset = start() + ZRememberedSet::to_offset(index);
-+    const zaddress addr = ZOffset::address(offset);
++  bool      have_base = false;
++  uintptr_t base_end  = 0;
 +
-+    function((volatile zpointer*)addr);
++  _permanent_writes.iterate([&](BitMap::idx_t index) {
++    const uintptr_t l_offset = ZRememberedSet::to_offset(index);
++
++    if (have_base && l_offset < base_end) {
++      // Same object as the previous bit. Bits are visited in ascending offset
++      // order and objects do not interleave, so this collapses every recorded
++      // field of an object into a single base lookup and a single visit.
++      return true;
++    }
++
++    // find_base_unsafe() rather than find_base(): the latter asserts that the
++    // generation is not marking, and this runs during old marking. The live map
++    // of a permanent page is pinned and precise, so the lookup is valid.
++    const zaddress field = ZOffset::address(start() + l_offset);
++    const zaddress_unsafe base = find_base_unsafe((volatile zpointer*)untype(field));
++    if (base == zaddress_unsafe::null) {
++      return true;
++    }
++
++    // A permanent object is never relocated, so its base is trivially safe.
++    const zaddress addr = safe(base);
++
++    have_base = true;
++    base_end = local_offset(addr) + align_up(ZUtils::object_size(addr), object_alignment());
++
++    function(to_oop(addr));
 +
 +    return true;
 +  });
@@ -1022,24 +1159,25 @@ index 6cacf699..3fe3f36f 100644
  inline uint64_t ZPage::last_used() const {
    return _last_used;
  }
-@@ -359,6 +407,15 @@ inline void ZPage::remember(volatile zpointer* p) {
+@@ -359,6 +422,16 @@ inline void ZPage::remember(volatile zpointer* p) {
    const zaddress addr = to_zaddress((uintptr_t)p);
    const uintptr_t l_offset = local_offset(addr);
    _remembered_set.set_current(l_offset);
 +
 +  if (is_permanent()) {
-+    // A reference was stored into a frozen page, so it may now hold an out-edge
-+    // that marking would never discover. Record the exact field; from the next
-+    // old marking cycle on it is scanned as a root. ZBarrier::remember() records
-+    // the field regardless of the generation of the stored value, so this covers
-+    // permanent->old as well as permanent->young.
++    // A reference was stored into a frozen page, so the object holding this
++    // field may now have an out-edge that marking would never discover. Record
++    // the field; from the next old marking cycle on, its object is traversed
++    // again. ZBarrier::remember() records the field regardless of the generation
++    // of the stored value, so this covers permanent-to-old as well as
++    // permanent-to-young.
 +    note_permanent_store(p);
 +  }
  }
  
  inline void ZPage::clear_remset_bit_non_par_current(uintptr_t l_offset) {
 diff --git a/src/hotspot/share/gc/z/zRelocationSetSelector.inline.hpp b/src/hotspot/share/gc/z/zRelocationSetSelector.inline.hpp
-index 316409ac..b487bad2 100644
+index 316409ac7..3a1c850de 100644
 --- a/src/hotspot/share/gc/z/zRelocationSetSelector.inline.hpp
 +++ b/src/hotspot/share/gc/z/zRelocationSetSelector.inline.hpp
 @@ -75,7 +75,13 @@ inline void ZRelocationSetSelectorGroup::register_live_page(ZPage* page) {
@@ -1049,16 +1187,16 @@ index 316409ac..b487bad2 100644
 -  if (!page->is_large() && garbage > _page_fragmentation_limit) {
 +  if (page->is_permanent()) {
 +    // Frozen. Never a relocation candidate, but the live bytes below must still
-+    // be accumulated: ZGeneration::select_relocation_set() used to skip these
-+    // pages entirely, so they contributed nothing to Live and their whole size
-+    // showed up as Garbage on every single collection. The heuristics then chase
-+    // a constant block of garbage that can never be reclaimed.
++    // be accumulated: skipping these pages entirely would make them contribute
++    // nothing to Live while their whole size shows up as Garbage on every
++    // collection, and the heuristics would then chase a constant block of
++    // garbage that can never be reclaimed.
 +  } else if (!page->is_large() && garbage > _page_fragmentation_limit) {
      _live_pages.append(page);
    } else if (page->is_young()) {
      _not_selected_pages.append(page);
 diff --git a/src/hotspot/share/gc/z/zStoreBarrierBuffer.cpp b/src/hotspot/share/gc/z/zStoreBarrierBuffer.cpp
-index 537609e7..de777389 100644
+index 537609e72..4c4b5d5e7 100644
 --- a/src/hotspot/share/gc/z/zStoreBarrierBuffer.cpp
 +++ b/src/hotspot/share/gc/z/zStoreBarrierBuffer.cpp
 @@ -26,6 +26,8 @@
@@ -1076,11 +1214,11 @@ index 537609e7..de777389 100644
  
 +  {
 +    // This is a deferred store into an old page. If that page is frozen the
-+    // store may have created an out-edge that marking will not find, so note it
-+    // here. ZPage::remember() cannot be relied upon on this path:
-+    // when the remembered sets were flipped below, scan_remembered_field()
-+    // drops the entry (and never calls ZPage::remember()) if the stored value
-+    // happens to be old, which is exactly the permanent->old case.
++    // store may have created an out-edge that marking would not find, so record
++    // it here. ZPage::remember() cannot be relied upon on this path: when the
++    // remembered sets were flipped, scan_remembered_field() below drops the
++    // entry (and never calls ZPage::remember()) if the stored value happens to
++    // be old, which is exactly the permanent-to-old case.
 +    ZPage* const page = ZHeap::heap()->page(p);
 +    if (page != nullptr && page->is_permanent()) {
 +      page->note_permanent_store(p);
@@ -1091,28 +1229,23 @@ index 537609e7..de777389 100644
    const bool woke_up_in_young_mark = last_mark_young_bits != ZPointerMarkedYoung;
  
 diff --git a/src/hotspot/share/gc/z/z_globals.hpp b/src/hotspot/share/gc/z/z_globals.hpp
-index 01fb0e0a..f6a28b48 100644
+index 01fb0e0a9..dedb2980a 100644
 --- a/src/hotspot/share/gc/z/z_globals.hpp
 +++ b/src/hotspot/share/gc/z/z_globals.hpp
-@@ -71,6 +71,22 @@
+@@ -71,6 +71,17 @@
            "Young generation tenuring threshold, -1 for dynamic computation")\
            range(-1, static_cast<int>(ZPageAgeMax))                          \
                                                                              \
 +  product(ccstr, ZFreezePath, nullptr, EXPERIMENTAL,                        \
-+          "Path of the freeze trigger file. ZGC creates this file at "       \
-+          "startup; deleting it requests that the current live set be "      \
++          "Path of the ZFreeze trigger file. ZGC creates this file at "     \
++          "startup; deleting it requests that the current live set be "     \
 +          "frozen into permanent pages that are never marked, never "       \
-+          "traversed, never relocated and never freed. "                     \
-+          "nullptr (default) disables the feature entirely.")                \
++          "traversed, never relocated and never freed. "                    \
++          "nullptr (default) disables the feature entirely.")               \
 +                                                                            \
-+  product(uintx, ZFreezeMinPollMillis, 500, EXPERIMENTAL,                    \
-+          "Minimum interval in milliseconds between checks of ZFreezePath")  \
-+          range(50, 60000)                                                   \
-+                                                                            \
-+  product(bool, ZFreezeVerifyNoAccess, false, DIAGNOSTIC,                    \
-+          "After freezing, mprotect permanent pages read-only so that any "  \
-+          "write is trapped immediately instead of silently demoting the "   \
-+          "page. Testing aid only - a legitimate write will abort the VM.")  \
++  product(uintx, ZFreezeMinPollMillis, 500, EXPERIMENTAL,                   \
++          "Minimum interval in milliseconds between checks of ZFreezePath") \
++          range(50, 60000)                                                  \
 +                                                                            \
    develop(size_t, ZForceDiscontiguousHeapReservations, 0,                   \
            "The gc will attempt to split the heap reservation into this "    \

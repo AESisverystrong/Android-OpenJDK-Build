@@ -1,0 +1,90 @@
+diff --git a/src/hotspot/share/gc/z/zDirector.cpp b/src/hotspot/share/gc/z/zDirector.cpp
+index 417ac33a6..625a6b186 100644
+--- a/src/hotspot/share/gc/z/zDirector.cpp
++++ b/src/hotspot/share/gc/z/zDirector.cpp
+@@ -409,6 +409,26 @@ static bool rule_major_timer(const ZDirectorStats& stats) {
+   return time_until_gc <= 0;
+ }
+ 
++static bool rule_major_old_usage(const ZDirectorStats& stats) {
++  if (ZOldUsageTriggerPercent == 0) {
++    // Rule disabled
++    return false;
++  }
++
++  // Perform GC if the old generation occupies too much of the heap. Unlike the
++  // other major rules this one is a hard threshold rather than a prediction: it
++  // does not wait for the cycle statistics to become trustable, and it does not
++  // try to estimate whether the collection would pay for itself.
++  const size_t soft_max_capacity = stats._heap._soft_max_heap_size;
++  const size_t old_used = stats._old_stats._general._used;
++  const double old_used_percent = percent_of(old_used, soft_max_capacity);
++
++  log_debug(gc, director)("Rule Major: Old Usage, OldUsed: %.1f%%, Threshold: " UINTX_FORMAT "%%",
++                          old_used_percent, ZOldUsageTriggerPercent);
++
++  return old_used_percent >= double(ZOldUsageTriggerPercent);
++}
++
+ static bool rule_major_warmup(const ZDirectorStats& stats) {
+   if (ZCollectionIntervalOnly) {
+     // Rule disabled
+@@ -621,6 +641,10 @@ static GCCause::Cause make_major_gc_decision(const ZDirectorStats& stats) {
+     return GCCause::_no_gc;
+   }
+ 
++  if (rule_major_old_usage(stats)) {
++    return GCCause::_z_high_usage;
++  }
++
+   if (rule_major_timer(stats)) {
+     return GCCause::_z_timer;
+   }
+diff --git a/src/hotspot/share/gc/z/zDriver.cpp b/src/hotspot/share/gc/z/zDriver.cpp
+index f0da73a7f..fbf214252 100644
+--- a/src/hotspot/share/gc/z/zDriver.cpp
++++ b/src/hotspot/share/gc/z/zDriver.cpp
+@@ -249,6 +249,7 @@ static bool should_clear_soft_references(GCCause::Cause cause) {
+   case GCCause::_z_warmup:
+   case GCCause::_z_allocation_rate:
+   case GCCause::_z_proactive:
++  case GCCause::_z_high_usage:
+   case GCCause::_metadata_GC_threshold:
+   case GCCause::_codecache_GC_threshold:
+   case GCCause::_codecache_GC_aggressive:
+@@ -281,6 +282,7 @@ static bool should_preclean_young(GCCause::Cause cause) {
+   case GCCause::_jvmti_force_gc:
+   case GCCause::_metadata_GC_clear_soft_refs:
+   case GCCause::_z_allocation_stall:
++  case GCCause::_z_high_usage:
+     return true;
+ 
+   case GCCause::_z_timer:
+@@ -351,6 +353,7 @@ void ZDriverMajor::collect(const ZDriverRequest& request) {
+   case GCCause::_z_proactive:
+   case GCCause::_codecache_GC_threshold:
+   case GCCause::_metadata_GC_threshold:
++  case GCCause::_z_high_usage:
+     // Start asynchronous GC
+     _port.send_async(request);
+     break;
+diff --git a/src/hotspot/share/gc/z/z_globals.hpp b/src/hotspot/share/gc/z/z_globals.hpp
+index 01fb0e0a9..2dd864153 100644
+--- a/src/hotspot/share/gc/z/z_globals.hpp
++++ b/src/hotspot/share/gc/z/z_globals.hpp
+@@ -67,6 +67,15 @@
+   develop(bool, ZVerifyOops, false,                                         \
+           "Verify accessed oops")                                           \
+                                                                             \
++  product(uintx, ZOldUsageTriggerPercent, 0, EXPERIMENTAL,                   \
++          "Start a full major collection (young pre-clean + old collection) " \
++          "as soon as old generation usage reaches this percentage of soft "  \
++          "max capacity. 0 (default) disables the rule. The rule is "         \
++          "unconditional: if old usage stays above the threshold after a "    \
++          "major collection, majors will keep being started, so pick a "      \
++          "threshold above the steady state live set.")                       \
++          range(0, 100)                                                       \
++                                                                            \
+   product(int, ZTenuringThreshold, -1, DIAGNOSTIC,                          \
+           "Young generation tenuring threshold, -1 for dynamic computation")\
+           range(-1, static_cast<int>(ZPageAgeMax))                          \
